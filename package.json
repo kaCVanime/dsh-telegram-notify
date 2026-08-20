@@ -1,8 +1,14 @@
 {
   "name": "dsh-telegram-notify",
   "version": "0.2.0",
-  "description": "Telegram notifications for DeepSeek Harness: ping you when a task finishes or the agent needs your input/approval.",
+  "description": "Telegram notifications for DeepSeek Harness: ping you when a task finishes or the agent needs your input/approval. DeepSeek Harness 的 Telegram 通知插件。",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/emiliagarfield6-bot/dsh-telegram-notify.git"
+  },
+  "homepage": "https://github.com/emiliagarfield6-bot/dsh-telegram-notify#readme",
+  "bugs": "https://github.com/emiliagarfield6-bot/dsh-telegram-notify/issues",
   "type": "module",
   "main": "index.js",
   "exports": {

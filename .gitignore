@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# 本地凭证与个人配置，绝不提交
+.env
+.env.*
+*.local
+.dsh/

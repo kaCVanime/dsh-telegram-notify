@@ -1,0 +1,24 @@
+# dsh-telegram-notify bundle layer: applied automatically when the package is
+# installed (package.json declares dsh.bundle.patch), i.e. a profile that runs
+#   dsh plugin --profile web add <this package>
+# gets this wiring without any manual cordis.patch.yml edits. Later layers (the
+# profile's own cordis.patch.yml, $DSH_HOME/cordis.patch.yml, --patch overlays)
+# override this row by id.
+#
+# This layer only MOUNTS the plugin with schema defaults. Credentials and
+# personal preferences belong in the profile layer, e.g.:
+#
+#   - id: telegram-notify
+#     config:
+#       token: "123456:ABC..."        # or env TELEGRAM_BOT_TOKEN
+#       chatId: "123456789"           # or env TELEGRAM_CHAT_ID
+#       proxy: "http://127.0.0.1:7890"
+#
+# Note: DSH patch config replaces the row's whole config object rather than
+# deep-merging, so an override should carry every field you care about; the
+# plugin's Config schema fills defaults for the rest. Without token/chatId the
+# plugin logs a warning and stays inert.
+
+- insert:
+    - id: telegram-notify
+      name: dsh-telegram-notify

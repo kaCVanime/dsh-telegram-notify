@@ -111,51 +111,51 @@ export function apply(ctx, config = {}) {
   // 官方规范接法：组合配置作为 base 层，设置文档的同名 namespace 覆盖其上，
   // 改动即时生效；服务缺席（旧 Host / headless）时回落到组合配置。
   let current = () => config
-  import('@deepseek-ai/dsh-settings')
-    .then(({ installSettingsSection }) => {
-      installSettingsSection(ctx, SETTINGS_NAMESPACE, Config, config, {
-        setSource: (source) => {
-          current = source
-        },
-        onChange: () => {
-          logger.info('telegram-notify: 设置已更新并即时生效')
-        },
-      })
+  ctx.inject(['settings'], (settingsCtx) => {
+    const { settings } = settingsCtx
+    if (typeof settings?.installSection !== 'function') {
+      logger.warn('telegram-notify: settings 服务缺少 installSection，使用组合配置')
+      return
+    }
+    settings.installSection(ctx, SETTINGS_NAMESPACE, Config, config, {
+      setSource: (source) => {
+        current = source
+      },
+      onChange: () => {
+        logger.info('telegram-notify: 设置已更新并即时生效')
+      },
     })
-    .catch((error) => {
-      logger.warn(
-        'telegram-notify: 设置服务不可用，使用组合配置: %s',
-        error?.message ?? error,
-      )
-    })
+  })
 
   const cfg = () => current()
   const resolveToken = () => cfg().token || process.env.TELEGRAM_BOT_TOKEN || ''
   const resolveChatId = () => cfg().chatId || process.env.TELEGRAM_CHAT_ID || ''
 
   // ---- Telegram 发送通道 -------------------------------------------------
-  // dispatcher 按代理地址缓存：设置页改代理后自动重建。
-  const dispatchers = new Map()
-  function dispatcherFor(proxyUrl) {
-    if (!proxyUrl) return Promise.resolve(undefined)
-    if (!dispatchers.has(proxyUrl)) {
-      dispatchers.set(
+  // 传输层按代理地址缓存：设置页改代理后自动重建。
+  // 代理必须配 undici 自带的 fetch：Node 内置 fetch 不认外部 undici 的 dispatcher
+  // （Node 24 + undici 8 会抛 UND_ERR_INVALID_ARG: invalid onRequestStart method）。
+  const transports = new Map()
+  function transportFor(proxyUrl) {
+    if (!proxyUrl) return Promise.resolve({ fetch: globalThis.fetch, dispatcher: undefined })
+    if (!transports.has(proxyUrl)) {
+      transports.set(
         proxyUrl,
         import('undici')
-          .then(({ ProxyAgent }) => {
+          .then(({ ProxyAgent, fetch }) => {
             logger.info('telegram-notify: 通过代理发送 %s', proxyUrl)
-            return new ProxyAgent(proxyUrl)
+            return { fetch, dispatcher: new ProxyAgent(proxyUrl) }
           })
           .catch((error) => {
             logger.warn(
               'telegram-notify: 代理初始化失败，改为直连: %s',
               error?.message ?? error,
             )
-            return undefined
+            return { fetch: globalThis.fetch, dispatcher: undefined }
           }),
       )
     }
-    return dispatchers.get(proxyUrl)
+    return transports.get(proxyUrl)
   }
 
   async function send(text) {
@@ -171,7 +171,7 @@ export function apply(ctx, config = {}) {
     const c = cfg()
     const proxyUrl =
       c.proxy || process.env.HTTPS_PROXY || process.env.https_proxy || ''
-    const dispatcher = await dispatcherFor(proxyUrl)
+    const { fetch: doFetch, dispatcher } = await transportFor(proxyUrl)
     const url = `${c.apiBase.replace(/\/+$/, '')}/bot${token}/sendMessage`
     const body = JSON.stringify({
       chat_id: chatId,
@@ -181,7 +181,7 @@ export function apply(ctx, config = {}) {
     })
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        const res = await fetch(url, {
+        const res = await doFetch(url, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body,
@@ -301,92 +301,48 @@ export function apply(ctx, config = {}) {
     })
   }
 
-  // ---- 2/3) 包装 userQuestions.ask 与 approval.request -------------------
-  // 服务由 dsh-base bundle 注册，理论上先于本插件就绪；仍做 60 秒重试兜底。
-  const restores = []
-  const wrapped = new Set()
-
-  function tryWrap() {
-    if (!wrapped.has('userQuestions')) {
-      const svc = ctx.get('userQuestions')
-      const orig = svc?.ask
-      if (svc && typeof orig === 'function') {
-        svc.ask = async function (req) {
-          try {
-            if (cfg().notifyOnQuestion) {
-              const qs = Array.isArray(req?.questions) ? req.questions : []
-              const lines = qs.map((q, i) => {
-                const head = q?.header ? `<b>${esc(trunc(q.header, 80))}</b> ` : ''
-                return `${i + 1}. ${head}${esc(trunc(q?.question ?? q?.id ?? '', 300))}`
-              })
-              fire(
-                `🔔 <b>DeepSeek Harness 需要你的回答</b>\n` +
-                  `会话：<code>${esc(sessionLabel(req?.agent))}</code>\n` +
-                  (lines.length ? lines.join('\n') : '有一个问题等待你确认。'),
-              )
-            }
-          } catch {
-            /* 通知失败不阻塞提问 */
-          }
-          return orig.call(this, req)
-        }
-        restores.push(() => {
-          svc.ask = orig
+  // ---- 2/3) 提问与审批：挂官方 waterfall 扩展点 --------------------------
+  // 两个服务各自派发 waterfall（'user-questions/request' / 'approval/request'）。
+  // 派发点在提问的参数校验之后、审批策略判定之后：被丢弃的提问、以及策略为
+  // never 时被自动拒绝的审批，都不会误报。
+  // ctx.on 本身是 effect，卸载自动注销；不改动服务对象，因此不会与其他插件
+  // 互相覆盖，也不依赖服务的注册时机。
+  // 监听器必须调用 next() 委派后续 answerer；审批侧监听器抛错会被判为
+  // fail-closed 的 unavailable，故通知全程 fire-and-forget，异常只写日志。
+  ctx.on('user-questions/request', (request, next) => {
+    try {
+      if (cfg().notifyOnQuestion) {
+        const qs = Array.isArray(request?.questions) ? request.questions : []
+        const lines = qs.map((q, i) => {
+          const head = q?.header ? `<b>${esc(trunc(q.header, 80))}</b> ` : ''
+          return `${i + 1}. ${head}${esc(trunc(q?.question ?? q?.id ?? '', 300))}`
         })
-        wrapped.add('userQuestions')
+        fire(
+          `🔔 <b>DeepSeek Harness 需要你的回答</b>\n` +
+            `会话：<code>${esc(sessionLabel(request?.agent))}</code>\n` +
+            (lines.length ? lines.join('\n') : '有一个问题等待你确认。'),
+        )
       }
+    } catch (error) {
+      logger.warn('telegram-notify: 提问通知异常: %s', error?.message ?? error)
     }
-    if (!wrapped.has('approval')) {
-      const svc = ctx.get('approval')
-      const orig = svc?.request
-      if (svc && typeof orig === 'function') {
-        svc.request = async function (req) {
-          try {
-            if (cfg().notifyOnApproval) {
-              fire(
-                `🛡️ <b>DeepSeek Harness 请求审批</b>\n` +
-                  `会话：<code>${esc(sessionLabel(req?.agent))}</code>\n` +
-                  `工具：<code>${esc(trunc(req?.toolName, 100))}</code>` +
-                  (req?.reason ? `\n原因：${esc(trunc(req.reason, 300))}` : ''),
-              )
-            }
-          } catch {
-            /* 通知失败不阻塞审批 */
-          }
-          return orig.call(this, req)
-        }
-        restores.push(() => {
-          svc.request = orig
-        })
-        wrapped.add('approval')
-      }
-    }
-    return wrapped.has('userQuestions') && wrapped.has('approval')
-  }
+    return next()
+  })
 
-  ctx.effect(function* () {
-    let timer
-    let timeout
-    if (!tryWrap()) {
-      timer = setInterval(() => {
-        if (tryWrap()) {
-          clearInterval(timer)
-          clearTimeout(timeout)
-        }
-      }, 2000)
-      timeout = setTimeout(() => clearInterval(timer), 60000)
-    }
-    yield () => {
-      if (timer) clearInterval(timer)
-      if (timeout) clearTimeout(timeout)
-      for (const restore of restores.splice(0)) {
-        try {
-          restore()
-        } catch {
-          /* ignore */
-        }
+  ctx.on('approval/request', (req, next) => {
+    try {
+      if (cfg().notifyOnApproval) {
+        fire(
+          `🛡️ <b>DeepSeek Harness 请求审批</b>\n` +
+            `会话：<code>${esc(sessionLabel(req?.agent))}</code>\n` +
+            `工具：<code>${esc(trunc(req?.toolName, 100))}</code>` +
+            (req?.reason ? `\n原因：${esc(trunc(req.reason, 300))}` : ''),
+        )
       }
+    } catch (error) {
+      logger.warn('telegram-notify: 审批通知异常: %s', error?.message ?? error)
     }
+    return next()
   })
 
   // ---- 4) 长期目标完成 / 阻塞 -------------------------------------------
@@ -398,7 +354,11 @@ export function apply(ctx, config = {}) {
       if (phase !== 'completed' && phase !== 'blocked') return
       if (!isRootAgent(agent)) return
       const done = phase === 'completed'
-      const reason = goal?.blockedReason ?? goal?.blocked_reason
+      // blockedReason 是 { code, message } 结构；直接插值会渲染成 [object Object]。
+      const blocked = goal?.blockedReason
+      const reason = typeof blocked === 'string'
+        ? blocked
+        : [blocked?.code, blocked?.message].filter(Boolean).join(': ')
       fire(
         `${done ? '🏁' : '⛔'} <b>DeepSeek Harness 长期目标${done ? '已完成' : '被阻塞'}</b>\n` +
           `会话：<code>${esc(sessionLabel(agent))}</code>\n` +
@@ -426,16 +386,20 @@ export function apply(ctx, config = {}) {
   })
 
   // ---- 上线自检 ----------------------------------------------------------
-  // 延迟几秒发出，让设置服务先接管配置来源。
-  setTimeout(() => {
-    if (cfg().sendStartupMessage) {
-      fire(
-        `🚀 <b>DSH Telegram 通知已上线</b>\n` +
-          `任务完成、需要你回答或审批时，会在这里提醒你。\n` +
-          `当前模式：${cfg().mode === 'complex' ? '复杂' : '简洁'}`,
-      )
-    }
-  }, 3000)
+  // 延迟几秒发出，让设置服务先接管配置来源；经 ctx.effect 注册，卸载/HMR 时
+  // 清理定时器，已卸载的实例不再发出上线消息。
+  ctx.effect(() => {
+    const timer = setTimeout(() => {
+      if (cfg().sendStartupMessage) {
+        fire(
+          `🚀 <b>DSH Telegram 通知已上线</b>\n` +
+            `任务完成、需要你回答或审批时，会在这里提醒你。\n` +
+            `当前模式：${cfg().mode === 'complex' ? '复杂' : '简洁'}`,
+        )
+      }
+    }, 3000)
+    return () => clearTimeout(timer)
+  })
 
   logger.info('telegram-notify: 已启用')
 }

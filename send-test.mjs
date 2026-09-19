@@ -15,16 +15,19 @@ if (!token || !chatId) {
   process.exit(1)
 }
 
+let doFetch = fetch
 let dispatcher
 if (proxy) {
-  const { ProxyAgent } = await import('undici').catch(() => {
+  const undici = await import('undici').catch(() => {
     console.error('undici not resolvable from here; run without TELEGRAM_PROXY or inside the DSH profile.')
     process.exit(1)
   })
-  dispatcher = new ProxyAgent(proxy)
+  // Node 内置 fetch 不认外部 undici 的 dispatcher，必须成对使用 undici 的 fetch
+  doFetch = undici.fetch
+  dispatcher = new undici.ProxyAgent(proxy)
 }
 
-const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+const res = await doFetch(`https://api.telegram.org/bot${token}/sendMessage`, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
   body: JSON.stringify({

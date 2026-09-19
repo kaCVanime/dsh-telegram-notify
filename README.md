@@ -1,73 +1,112 @@
 # dsh-telegram-notify
 
-DeepSeek Harness（DSH）的 Telegram 通知插件。当 agent **任务完成**、**向你提问**、
-**请求审批**或**长期目标完成/被阻塞**时，自动给你的 Telegram 发消息。
+Telegram notifications for DeepSeek Harness (DSH). Get a message when an agent
+**finishes a task**, **needs an answer**, **asks for approval**, or when a
+**long-running goal completes or gets blocked**.
 
-## 触发时机
+## Changes
 
-| 事件 | 消息 | 开关（默认） |
+- **Fixed: nothing was sent when a proxy was configured.** Node's built-in
+  `fetch` rejects a dispatcher from the npm `undici` package
+  (`UND_ERR_INVALID_ARG`), so the plugin now uses `undici`'s own `fetch`
+  together with its `ProxyAgent`.
+- **Fixed: the settings card did nothing.** The namespace is registered through
+  the real API (`ctx.inject(['settings'])` + `settings.installSection`) now, so
+  settings-page edits actually apply.
+- **Fewer false alarms.** Approvals and questions are read from DSH's
+  `approval/request` and `user-questions/request` waterfalls, so approvals DSH
+  rejects by itself and questions that get discarded no longer notify.
+- **Fixed: blocked goals showed `[object Object]`** instead of the reason.
+- **Fixed: a configured proxy could silently be ignored.** `undici` is a
+  declared dependency now, loaded only when a proxy is set.
+- **Install with `file:` or `link:`.** A bare path (`add .`) makes pnpm symlink
+  the checkout without installing its dependencies, which stops DSH from
+  starting.
+- The startup message is no longer re-sent after a hot reload.
+
+## When it notifies
+
+| Event | Message | Switch (default) |
 | --- | --- | --- |
-| agent 从运行回到空闲 | ✅ 任务完成（内容取决于通知模式，见下） | `notifyOnIdle`（开） |
-| agent 调用 `ask_user_question` | 🔔 需要你的回答（附问题内容） | `notifyOnQuestion`（开） |
-| agent 请求工具审批 | 🛡️ 请求审批（附工具名和原因） | `notifyOnApproval`（开） |
-| 长期目标完成 / 被阻塞 | 🏁 / ⛔（附目标与原因） | `notifyOnGoal`（开） |
-| agent 运行出错 | ⚠️ 错误摘要 | `notifyOnError`（关） |
+| Agent goes from running to idle | ✅ Task finished (content depends on the mode) | `notifyOnIdle` (on) |
+| Agent calls `ask_user_question` | 🔔 Your answer is needed (with the question) | `notifyOnQuestion` (on) |
+| Agent requests tool approval | 🛡️ Approval requested (with tool and reason) | `notifyOnApproval` (on) |
+| Long-running goal completes / gets blocked | 🏁 / ⛔ (with the goal and reason) | `notifyOnGoal` (on) |
+| Agent run fails | ⚠️ Error summary | `notifyOnError` (off) |
 
-「任务完成」做了两项降噪：连续运行不足 `minRunSeconds`（默认 30 秒）不通知；
-回到空闲后去抖 8 秒（goal 自动续轮、追问等不会重复发）。只有根会话会通知，
-子 agent（subagent）结束不会打扰你。
+"Task finished" is deliberately quiet: runs shorter than `minRunSeconds`
+(default 30 seconds) are skipped, and an 8-second debounce after going idle
+stops goal auto-continuation from sending a second message. Only root sessions
+notify, so a subagent finishing won't ping you.
 
-## 通知模式
+## Notification modes
 
-- **简洁模式**（`mode: "simple"`，默认）：只通知任务结果——✅ 任务完成 + 会话 + 等待输入。
-- **复杂模式**（`mode: "complex"`）：在结果之上附带**任务用时**、**token 消耗**
-  （输入/输出）与**缓存命中率**（按最后一轮各 step 的 provider 用量汇总）。
-- **产出内容**（`sendTaskContent`，默认关）：仅复杂模式下有效。开启后把本轮的
-  **最终产出内容**作为单独一条消息一并发送（超长自动截断到 Telegram 上限内）。
+- **Simple** (`mode: "simple"`, default): just the result — ✅ task finished,
+  session, waiting for you.
+- **Complex** (`mode: "complex"`): adds **duration**, **token usage**
+  (input/output) and **cache hit rate**, summed over the last turn's steps.
+- **Task output** (`sendTaskContent`, off by default): complex mode only. Sends
+  the turn's final output as a second message, truncated to Telegram's limit.
 
-## 安装
+## Install
 
-本插件遵循 DSH 的插件包契约：`package.json` 声明 `dsh.bundle.patch` 指向自带的
-bundle 层 `cordis.patch.yml`，通过 `dsh plugin` 安装后自动挂载，无需手工编辑
-profile 的补丁文件。
+The package follows DSH's plugin contract: `package.json` declares
+`dsh.bundle.patch` pointing at its own `cordis.patch.yml`, so installing it
+mounts it automatically — you never edit a profile patch file by hand.
+
+Give pnpm an explicit `file:` (or `link:`) prefix. A bare directory path such as
+`add .` is recorded as a symlink **without installing the plugin's
+dependencies**, and DSH then fails to start with
+`Cannot find package '@deepseek-ai/schemastery'`.
 
 ```powershell
-# 在本插件源码目录执行（相对路径会以当前目录为锚点）
-dsh plugin --profile web add .
+# from the plugin checkout: file: copies the package and its dependencies in
+dsh plugin --profile web add file:.
 
-# 或从任意目录给出包位置（npm 包名 / github: / file: 路径均可）
-dsh plugin --profile web add file:/绝对路径/dsh-telegram-notify
+# or from anywhere (path / npm name / github:)
+dsh plugin --profile web add file:/absolute/path/dsh-telegram-notify
 ```
 
-`dsh plugin` 会把包交给 pnpm 装进 profile，并自动把声明了 `dsh.bundle` 的包追加到
-profile `package.json` 的 `dsh.profile.bundles` 层列表——之后每次启动，bundle 层的
-insert 行负责挂载插件，你的 profile `cordis.patch.yml` 只需放个人配置覆盖。
+Running DSH through npx? Prefix the same command with npx:
+`npx --yes @deepseek-ai/dsh plugin --profile web add file:.`
 
-> 开发提示：`file:` 依赖是安装时打包复制的，改了源码要重新 `dsh plugin add` 才会生效；
-> 想在源码目录里边改边用，可以用 `dsh plugin --profile web add link:<路径>`（符号链接）。
-> 卸载：`dsh plugin --profile web remove dsh-telegram-notify`（reconcile 会自动把它移出
-> bundles 列表）。
+`dsh plugin` hands the package to pnpm inside the profile, then appends anything
+that declares `dsh.bundle` to `dsh.profile.bundles` in the profile's
+`package.json`. Every start after that mounts the plugin; your profile
+`cordis.patch.yml` only holds personal config.
 
-## 配置
+Developing the plugin itself? Link it so edits apply on the next restart — but
+install the checkout's dependencies first, or you hit the error above:
 
-插件自带浏览器端卡片：打开 **设置 > 插件 > 插件配置**，「Telegram 通知」卡片里
-可直接编辑全部配置项——bot token（只写密码框）、chatId、API 地址、代理、
-**通知模式（简洁/复杂）**、**附带产出内容**、最短运行秒数和各个通知开关，
-**保存后即时生效，无需重启**。卡片走的是与官方插件相同的机制：
-`settings.plugin.item` slot + `settingsScope` 客户端服务 + `settings.mutate` 写入。
-token 字段在 schema 声明为 `role('secret')`，界面只写不读，不会回传明文。
+```powershell
+cd <plugin checkout>
+pnpm install
+dsh plugin --profile web add link:<absolute path>
+```
 
-配置优先级（高 → 低）：设置页（写入 `%USERPROFILE%\.dsh\settings.yaml` 的
-`telegram-notify` 命名空间）> profile `cordis.patch.yml` 的 config > 环境变量
-`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` > schema 默认值。
+Uninstall: `dsh plugin --profile web remove dsh-telegram-notify`.
 
-首次配置步骤：
+## Configure
 
-1. 在 Telegram 找 **@BotFather** 创建 bot，拿到 token。
-2. 给你的 bot 随便发一条消息，再找 **@userinfobot**（或访问
-   `https://api.telegram.org/bot<token>/getUpdates`）拿到你的 chat id。
-3. 在 **设置 > 插件 > 插件配置 > telegram-notify** 填入 token / chatId（国内网络
-   一并填 `proxy`）；也可以改在 profile 的 `cordis.patch.yml`：
+The plugin adds a card under **Settings > Plugins > Plugin configuration** where
+you can edit everything: bot token (write-only password field), chat ID, API
+base, proxy, notification mode, task output, minimum run seconds and each
+switch. **Changes take effect immediately — no restart needed.** The token is
+declared `role('secret')` and is never sent back to the browser.
+
+Precedence, highest first: settings page (the `telegram-notify` namespace in
+`~/.dsh/settings.yaml`) > profile `cordis.patch.yml` config >
+`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` environment variables > schema
+defaults.
+
+First-time setup:
+
+1. Create a bot with **@BotFather** and copy its token.
+2. Send your bot any message, then read your chat ID from **@userinfobot** (or
+   `https://api.telegram.org/bot<token>/getUpdates`).
+3. Enter token and chat ID in **Settings > Plugins > Plugin configuration >
+   telegram-notify** — add `proxy` too if your network can't reach Telegram. Or
+   set them in the profile's `cordis.patch.yml`:
 
    ```yaml
    - id: telegram-notify
@@ -77,25 +116,28 @@ token 字段在 schema 声明为 `role('secret')`，界面只写不读，不会�
        proxy: "http://127.0.0.1:7890"
    ```
 
-   注意：DSH 的 patch config 是**整段替换**而非深度合并，覆盖时请带上你要设置的全部
-   字段；未列出的字段走插件 Config schema 的默认值。
-4. **重启 DSH**（关闭后重新 `dsh web`）。插件只在启动时加载。
-5. 启动成功会收到「🚀 DSH Telegram 通知已上线」，收不到就看 DSH 日志里
-   `telegram-notify` 的警告。也可以用 `dsh --profile web --dump-config` 检查组合后的
-   插件树中本插件的配置是否符合预期。
+   DSH patch config **replaces the whole config object** instead of
+   deep-merging, so include every field you care about; the rest fall back to
+   schema defaults.
 
-### 完整配置项
+4. **Restart DSH** (`dsh web`, or `npx --yes @deepseek-ai/dsh web` if that's how
+   you run it). The plugin loads at startup.
+5. Success looks like a "🚀 DSH Telegram notify is online" message. If it
+   doesn't arrive, check the DSH log for `telegram-notify` warnings, or inspect
+   the composed tree with `dsh --profile web --dump-config`.
+
+### All options
 
 ```yaml
 - id: telegram-notify
   config:
-    token: "123456:ABC..."        # 或环境变量 TELEGRAM_BOT_TOKEN（secret，设置页只写）
-    chatId: "123456789"           # 或环境变量 TELEGRAM_CHAT_ID
-    apiBase: "https://api.telegram.org"  # 可换成自己的反代
-    proxy: "http://127.0.0.1:7890"       # 国内网络按需设置（http 代理）
-    mode: "simple"                # simple=只报结果；complex=附耗时/token/缓存命中率
-    sendTaskContent: false        # 复杂模式下，是否附带本轮最终产出内容
-    minRunSeconds: 30             # 运行不足此时长不通知
+    token: "123456:ABC..."      # or TELEGRAM_BOT_TOKEN (secret, write-only in the UI)
+    chatId: "123456789"         # or TELEGRAM_CHAT_ID
+    apiBase: "https://api.telegram.org"  # point at your own reverse proxy if you prefer
+    proxy: "http://127.0.0.1:7890"       # HTTP proxy; needed where Telegram is blocked
+    mode: "simple"              # simple = result only; complex = + duration/tokens/cache
+    sendTaskContent: false      # complex mode: also send the turn's final output
+    minRunSeconds: 30           # don't notify for runs shorter than this
     notifyOnIdle: true
     notifyOnQuestion: true
     notifyOnApproval: true
@@ -104,28 +146,34 @@ token 字段在 schema 声明为 `role('secret')`，界面只写不读，不会�
     sendStartupMessage: true
 ```
 
-### 国内网络
+### If Telegram is blocked
 
-`api.telegram.org` 在国内不可直连。两种方式任选：
+`api.telegram.org` is unreachable from some networks. Either set `proxy` (or
+`HTTPS_PROXY`) to your local HTTP proxy — the plugin loads `undici`'s
+`ProxyAgent` on demand, because Node's built-in `fetch` can't take a proxy — or
+point `apiBase` at your own reverse proxy.
 
-- 设置 `proxy`（或环境变量 `HTTPS_PROXY`）为你的本地 http 代理；
-- 或把 `apiBase` 改成自建/第三方反代地址。
+## How it works
 
-## 原理
+DSH is built on the cordis plugin system. The plugin listens on the root
+context:
 
-DSH 基于 cordis 插件系统。本插件在根上下文监听：
-
-- `agent/status`（running→idle 判定任务完成，用 `ctx.agents.roots()` 过滤子 agent）
-- `goal/changed`（phase 为 completed / blocked）
+- `agent/status` — running → idle means a task finished (subagents are filtered
+  out with `ctx.agents.roots()`)
+- `goal/changed` — phase `completed` or `blocked`
 - `agent/error`
+- `user-questions/request` and `approval/request` — DSH's waterfalls, dispatched
+  when a human is really being asked. The listener sends the message and calls
+  `next()` to hand the request to the real answerer (the DSH UI), which is why
+  discarded questions and auto-rejected approvals never notify. `ctx.on` is an
+  effect, so unloading cancels it automatically.
 
-并包装 `ctx.userQuestions.ask` 与 `ctx.approval.request` 两个服务方法，
-在转发给原实现前先发一条 Telegram 消息。
+Settings use `ctx.inject(['settings'])` + `settings.installSection`: the
+composition config is the base layer, the settings document's `telegram-notify`
+namespace overrides it, and changes are picked up live. Token usage and task
+output are read from the last turn's `assistant/message` events in
+`agent.session.events` (`usage.inputTokens / outputTokens / cacheReadTokens`;
+the text is the last text block).
 
-配置通过官方 `installSettingsSection`（`@deepseek-ai/dsh-settings`）接入设置服务：
-组合配置作为 base 层，设置文档的 `telegram-notify` namespace 覆盖其上，
-`scope.watch` 让设置页编辑即时生效。token 用量与产出内容从
-`agent.session.events` 的最后一轮 `assistant/message` 事件汇总
-（`usage.inputTokens / outputTokens / cacheReadTokens`，文本取最后一条 text block）。
-
-通知全部 fire-and-forget，失败只写日志，绝不影响 agent 主流程。
+Notifications are fire-and-forget: a failure is logged and never blocks the
+agent.

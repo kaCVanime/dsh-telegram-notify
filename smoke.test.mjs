@@ -9,7 +9,6 @@ globalThis.fetch = async (url, opts) => {
 }
 
 const listeners = {}
-const svc = { ask: async () => 'answer', request: async () => 'allowed-once' }
 
 // ---- fake session events：最后一轮 2 个 step，带 usage 与产出文本 --------
 const agent = {
@@ -43,13 +42,15 @@ const watchers = new Set()
 let settingsValue
 let pluginConfigSchema
 const fakeSettings = {
-  register(ns, schema, opts) {
+  installSection(owner, ns, schema, entry, hooks) {
     pluginConfigSchema = schema
-    settingsValue = schema(opts?.base ?? {})
-    return {
+    settingsValue = schema(entry)
+    const scope = {
       get: () => settingsValue,
       watch: (cb) => { watchers.add(cb); return () => watchers.delete(cb) },
     }
+    hooks.setSource(() => scope.get())
+    scope.watch(() => hooks.onChange())
   },
 }
 // 模拟「设置 > 插件 > 插件配置」里的编辑：改值并通知 watcher
@@ -59,8 +60,9 @@ const settingsEdit = async (patch) => {
 }
 
 const runEffect = (fn) => {
-  const gen = fn.call(ctx)
-  gen.next()
+  // 既支持生成器 effect，也支持返回 disposer 的普通 effect（上线自检定时器）
+  const result = fn.call(ctx)
+  if (result && typeof result.next === 'function') result.next()
 }
 const ctx = {
   logger: () => ({
@@ -72,16 +74,12 @@ const ctx = {
   inject: (deps, cb) => {
     if (deps.includes('settings')) cb({ settings: fakeSettings, effect: runEffect })
   },
-  get: (k) =>
-    k === 'userQuestions' ? svc
-    : k === 'approval' ? svc
-    : k === 'agents' ? { roots: () => [agent] }
-    : undefined,
+  get: (k) => (k === 'agents' ? { roots: () => [agent] } : undefined),
 }
 
 const m = await import('dsh-telegram-notify')
 m.apply(ctx, m.Config({ token: 'T', chatId: 'C', minRunSeconds: 0, mode: 'complex', sendTaskContent: true }))
-await new Promise((r) => setTimeout(r, 500)) // 等动态 import(dsh-settings) 接管
+await new Promise((r) => setTimeout(r, 500)) // 等 ctx.inject 的 settings 回调接管
 
 const fireStatus = (status) => { for (const fn of listeners['agent/status'] ?? []) fn({ agent, status }) }
 const runTurn = async () => {
@@ -101,6 +99,36 @@ await runTurn()
 // 3) 复杂模式但不发产出内容：应有结果消息，无内容消息
 await settingsEdit({ mode: 'complex', sendTaskContent: false })
 await runTurn()
+
+// 4) 提问 / 审批走官方 waterfall：监听器必须 next() 委派给后续 answerer。
+//    这里在插件之后追加一个 answerer，用来验证委派确实发生。
+const fireWaterfall = async (event, payload) => {
+  const handlers = listeners[event] ?? []
+  let i = 0
+  const next = async () => {
+    const handler = handlers[i++]
+    return handler ? handler(payload, next) : 'no-answerer'
+  }
+  return next()
+}
+;(listeners['user-questions/request'] ??= []).push(() => 'stub-answer')
+const questionAnswer = await fireWaterfall('user-questions/request', {
+  agent,
+  questions: [{ id: 'q1', header: '确认', question: '是否继续？' }],
+})
+const approvalAnswer = await fireWaterfall('approval/request', {
+  agent, toolName: 'bash', reason: '需要 sudo',
+})
+await new Promise((r) => setTimeout(r, 300))
+console.log('[check] 提问 waterfall 委派结果:', questionAnswer)
+console.log('[check] 审批 waterfall 委派结果:', approvalAnswer)
+
+// 5) goal 阻塞原因（{ code, message } 结构）
+listeners['goal/changed'][0]({
+  agent,
+  change: { goal: { phase: 'blocked', objective: '修复构建', blockedReason: { code: 'no-network', message: '无法访问 registry' } } },
+})
+await new Promise((r) => setTimeout(r, 300))
 
 console.log('=== captured messages ===')
 sent.forEach((t, i) => console.log(`--- [${i + 1}] ---\n${t}`))
